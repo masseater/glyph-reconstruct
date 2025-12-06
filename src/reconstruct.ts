@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { randomUUID } from "node:crypto";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readdirSync, existsSync, readFileSync, copyFileSync } from "node:fs";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import Bottleneck from "bottleneck";
 import { z } from "zod";
@@ -46,23 +46,24 @@ const VISION_MODEL_NAME = "gemini-3-pro-preview";
 const IMAGE_MODEL_NAME = "gemini-3-pro-image-preview";
 const API_KEY = process.env.GEMINI_API_KEY;
 
-function getClient() {
-  if (!API_KEY) {
-    throw new Error("GEMINI_API_KEY is required");
+let _client: GoogleGenAI | null = null;
+
+function getClient(): GoogleGenAI {
+  if (!_client) {
+    if (!API_KEY) {
+      throw new Error("GEMINI_API_KEY is required");
+    }
+    _client = new GoogleGenAI({ apiKey: API_KEY });
   }
-  return new GoogleGenAI({ apiKey: API_KEY });
+  return _client;
 }
 
-const client = getClient();
-
 // Zod schema for structured output
-const glyphDescriptionZod = z.object({
+const glyphDescriptionSchema = z.toJSONSchema(z.object({
   codePoint: z.string().describe("Unicode code point (e.g., U+3042)"),
   description: z.string().describe("Detailed visual description of the glyph shape"),
   visualTags: z.array(z.string()).describe("Visual characteristics tags")
-});
-
-const glyphDescriptionSchema = z.toJSONSchema(glyphDescriptionZod);
+}));
 
 // ========================================
 // Step 1: Vision AIでテキスト記述を生成
@@ -90,14 +91,15 @@ type Description = {
 
 async function generateDescription(char: string): Promise<Description> {
   return withRetry(async () => {
-    const response = await client.models.generateContent({
+    const response = await getClient().models.generateContent({
       model: VISION_MODEL_NAME,
       contents: buildUserPrompt(char),
       config: {
         systemInstruction: SYSTEM_PROMPT,
         responseMimeType: "application/json",
         responseJsonSchema: glyphDescriptionSchema,
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        temperature: 0
       }
     });
 
@@ -122,11 +124,13 @@ async function generateDescription(char: string): Promise<Description> {
 // ========================================
 function buildImagePrompt(description: string): string {
   return [
-    `Create a single typographic glyph with the following visual characteristics: ${description}`,
-    "Render on white background, high contrast, centered composition.",
-    "Incorporate the distinctive characteristics of Ronald McDonald into the glyph design.",
-    "Centered composition.",
-    "Output only the glyph shape itself, no text, no labels, no annotations."
+    `Create a typographic glyph with these characteristics: ${description}`,
+    "Transform this glyph through AI-style image-to-image distortion.",
+    "The character should retain its basic shape but become organically warped, with strokes that bleed, merge, and develop complex textures.",
+    "Imagine the glyph has been processed through multiple AI generations - edges become fuzzy, details emerge like townscapes or abstract patterns within the strokes.",
+    "The result should look like a dreamlike, slightly corrupted version of the original character - recognizable but mutated.",
+    "Render in black on white background, centered.",
+    "Output only the glyph, no labels, no annotations."
   ].join(" ");
 }
 
@@ -134,14 +138,15 @@ async function generateGlyphImage(description: string): Promise<string> {
   return withRetry(async () => {
     const prompt = buildImagePrompt(description);
 
-    const response = await client.models.generateContent({
+    const response = await getClient().models.generateContent({
       model: IMAGE_MODEL_NAME,
       contents: prompt,
       config: {
         responseModalities: ["image", "text"],
         imageConfig: {
           aspectRatio: "1:1"
-        }
+        },
+        temperature: 1.5,
       }
     });
 
@@ -159,7 +164,42 @@ async function generateGlyphImage(description: string): Promise<string> {
   });
 }
 
+function findLatestOutputDir(): string | null {
+  const outputBase = "output";
+  if (!existsSync(outputBase)) return null;
+
+  const dirs = readdirSync(outputBase, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => d.name)
+    .sort()
+    .reverse();
+
+  return dirs.length > 0 ? `${outputBase}/${dirs[0]}` : null;
+}
+
+function copyDescriptionsFromDir(sourceDir: string, targetDir: string, chars: string[]): Map<string, Description> {
+  const descriptions = new Map<string, Description>();
+
+  for (const char of chars) {
+    const sourceFile = `${sourceDir}/description-${char}.json`;
+    const targetFile = `${targetDir}/description-${char}.json`;
+
+    if (existsSync(sourceFile)) {
+      copyFileSync(sourceFile, targetFile);
+      const content = readFileSync(sourceFile, "utf-8");
+      descriptions.set(char, JSON.parse(content));
+    }
+  }
+
+  return descriptions;
+}
+
 async function main() {
+  const reuseDescriptions = process.argv.includes("--reuse-descriptions");
+
+  // 新しいディレクトリを作る前に最新ディレクトリを取得
+  const latestDir = reuseDescriptions ? findLatestOutputDir() : null;
+
   const sessionId = randomUUID();
   const timestamp = new Date().toLocaleString("sv-SE", { timeZone: "Asia/Tokyo" }).replace(/:/g, "-").replace(/ /g, "T");
   const outputDir = `output/${timestamp}`;
@@ -204,20 +244,35 @@ async function main() {
     };
   }
 
-  // Phase 1: 全文字のdescription生成
-  const bar1 = createBar('Descriptions', chars.length);
-  bar1.start();
-  const descriptions = await Promise.all(
-    chars.map(char => limiter.schedule(async () => {
-      bar1.incProcessing();
-      const desc = await generateDescription(char);
-      const descPath = `${outputDir}/description-${char}.json`;
-      writeFileSync(descPath, JSON.stringify(desc, null, 2));
-      bar1.decProcessingIncDone();
-      return { char, desc };
-    }))
-  );
-  bar1.stop();
+  // Phase 1: 全文字のdescription生成（または流用）
+  let descriptions: { char: string; desc: Description }[];
+
+  if (reuseDescriptions) {
+    if (!latestDir) {
+      console.error("Error: No previous output directory found to reuse descriptions from.");
+      process.exit(1);
+    }
+    console.error(`Reusing descriptions from: ${latestDir}`);
+    const descMap = copyDescriptionsFromDir(latestDir, outputDir, chars);
+    descriptions = chars
+      .filter(char => descMap.has(char))
+      .map(char => ({ char, desc: descMap.get(char)! }));
+    console.error(`Copied ${descriptions.length}/${chars.length} descriptions\n`);
+  } else {
+    const bar1 = createBar('Descriptions', chars.length);
+    bar1.start();
+    descriptions = await Promise.all(
+      chars.map(char => limiter.schedule(async () => {
+        bar1.incProcessing();
+        const desc = await generateDescription(char);
+        const descPath = `${outputDir}/description-${char}.json`;
+        writeFileSync(descPath, JSON.stringify(desc, null, 2));
+        bar1.decProcessingIncDone();
+        return { char, desc };
+      }))
+    );
+    bar1.stop();
+  }
 
   // Phase 2: 全文字の画像生成
   const bar2 = createBar('Images      ', chars.length);
