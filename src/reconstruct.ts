@@ -6,7 +6,7 @@ import Bottleneck from "bottleneck";
 import { z } from "zod";
 
 // Rate limiter: Gemini API limits (adjust based on your tier)
-const RPM = Number(process.env.GEMINI_RPM) || 300;
+const RPM = 300;
 const limiter = new Bottleneck({
   maxConcurrent: 100,
   minTime: Math.ceil(60000 / RPM) // ms between requests to stay under RPM
@@ -124,12 +124,8 @@ async function generateDescription(char: string): Promise<Description> {
 // ========================================
 function buildImagePrompt(description: string): string {
   return [
-    `Create a typographic glyph with these characteristics: ${description}`,
-    "Transform this glyph through AI-style image-to-image distortion.",
-    "The character should retain its basic shape but become organically warped, with strokes that bleed, merge, and develop complex textures.",
-    "Imagine the glyph has been processed through multiple AI generations - edges become fuzzy, details emerge like townscapes or abstract patterns within the strokes.",
-    "The result should look like a dreamlike, slightly corrupted version of the original character - recognizable but mutated.",
-    "Render in black on white background, centered.",
+    `Create a typographic glyph with these visual characteristics: ${description}`,
+    "Render the glyph cleanly in black on white background, centered.",
     "Output only the glyph, no labels, no annotations."
   ].join(" ");
 }

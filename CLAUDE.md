@@ -4,83 +4,68 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # ai-font
 
-A two-stage AI pipeline using Google Gemini that reconstructs glyphs: text input → Gemini vision description → Gemini image generation.
+A two-stage AI pipeline using Google Gemini 3 that reconstructs glyphs: text input → Gemini vision description → Gemini image generation.
 
 ## Architecture
 
 ```
-Character Input → Gemini (Vision) → Text Description → Gemini (Image) → PNG Image
+Character Input → Gemini 3 Pro (Vision) → Text Description → Gemini 3 Pro Image → PNG Image
 ```
 
 **Two-stage pipeline:**
-1. **Gemini Vision** (src/reconstruct.ts): Analyzes glyph visual characteristics and generates natural language descriptions
-2. **Gemini Image Generation** (src/image-generator.ts): Reconstructs glyph images from text descriptions
+1. **Gemini Vision** (src/reconstruct.ts): Analyzes glyph visual characteristics and generates structured JSON descriptions
+2. **Gemini Image Generation** (src/reconstruct.ts): Reconstructs glyph images from text descriptions with AI-style distortion
 
 **Key design principles:**
 - Vision descriptions must NOT mention character names/letters, only visual shapes
-- Vision API uses `@google/generative-ai` SDK with `generateContent()`
-- Image generation uses Google Generative Language REST API directly
-- Gemini returns JSON wrapped in markdown code blocks - must be cleaned before parsing
+- Uses `@google/genai` SDK with `generateContent()` for both vision and image generation
+- Vision API uses `responseMimeType: "application/json"` with `responseJsonSchema` for structured output
+- Image generation uses `responseModalities: ["image", "text"]` with `imageConfig`
 - Zod schemas define expected outputs: `{codePoint, description, visualTags[]}`
 - Each run gets a unique session ID for provenance tracking
 
 ## Commands
 
 ```bash
-# Install dependencies
-bun install
-
-# Run reconstruction pipeline
-bun run reconstruct
+bun install              # Install dependencies
+bun run reconstruct      # Run reconstruction pipeline
+bun run reconstruct --reuse-descriptions  # Skip description generation, reuse from latest run
 ```
 
 ## Environment Variables
 
 ```bash
-# Gemini Vision
-VISION_MODEL_NAME=gemini-2.0-flash-exp
-VISION_API_KEY=your-gemini-api-key
-
-# Gemini Image Generation
-IMAGE_MODEL_NAME=imagen-3.0-generate-001
-IMAGE_API_KEY=your-gemini-api-key  # Can be same as VISION_API_KEY
+GEMINI_API_KEY=your-gemini-api-key  # Required, used for both vision and image
 ```
 
-**Important notes:**
-- Gemini uses `generateContent()` (not `generateObject()`) - returns text that must be parsed
-- Response cleaning is required: strips ```json and ``` markdown wrappers
-- Both vision and image generation use Google Generative Language API
+Models are hardcoded in src/reconstruct.ts:45-46:
+- Vision: `gemini-3-pro-preview`
+- Image: `gemini-3-pro-image-preview`
 
 ## Code Structure
 
-### src/reconstruct.ts (Main Pipeline)
-**Configuration constants at top of file:**
+### src/reconstruct.ts (Single-file Pipeline)
+All pipeline logic is in this single file:
+
+**Configuration constants:**
 ```typescript
-const START_CHAR = "あ";  // First character in range
-const END_CHAR = "ん";    // Last character in range
+const START_CHAR = "あ";  // First character in range (line 41)
+const END_CHAR = "ん";    // Last character in range (line 42)
 ```
 
-**Pipeline flow:**
-1. `generateDescription(char)` - Calls Gemini via `@google/generative-ai`
-2. Cleans JSON response (removes markdown code blocks)
-3. Saves description JSON to `output/{timestamp}/description-{char}.json`
-4. `generateGlyphImage()` - Generates image from description
-5. `downloadAndSaveImage()` - Saves PNG to `output/{timestamp}/{char}.png`
+**Key functions:**
+- `generateDescription(char)` - Calls Gemini vision with JSON schema (line 92)
+- `generateGlyphImage(description)` - Generates distorted glyph image (line 137)
+- `buildImagePrompt()` - Creates prompt for AI-style "dreamlike, slightly corrupted" glyphs (line 125)
+- `withRetry()` - Exponential backoff for 503/429 errors (line 15)
 
-**Concurrency:** Uses `p-limit` with `MAX_CONCURRENT = 20` for batch processing
-
-### src/image-generator.ts
-- `generateGlyphImage()`: Calls Google Generative Language API directly
-- Uses `responseModalities: ["image"]` with `imageConfig` for image generation
-- `buildImagePrompt()`: Constructs image generation prompt emphasizing "no text, no labels, no annotations"
-- `downloadAndSaveImage()`: Handles both data URIs and HTTP URLs
-- Returns base64-encoded images as data URIs
+**Rate limiting:** Uses `Bottleneck` with `maxConcurrent: 100` and dynamic minTime based on GEMINI_RPM
 
 ## Output Files
 
 ```
 output/
-  {timestamp}/                    # Created by reconstruct.ts
+  {timestamp}/                    # ISO timestamp with Tokyo timezone
     prompt-template.txt           # System/user prompt template
     description-{char}.json       # Gemini vision output per character
     {char}.png                    # Generated glyph images
@@ -88,12 +73,10 @@ output/
 
 ## Modifying the Pipeline
 
-**To change character range:** Edit `START_CHAR` and `END_CHAR` in src/reconstruct.ts:12-13
+**To change character range:** Edit `START_CHAR` and `END_CHAR` in src/reconstruct.ts:41-42
 
 **To change Gemini vision prompts:**
-- System prompt: `SYSTEM_PROMPT` constant (src/reconstruct.ts:42)
-- User prompt: `buildUserPrompt()` function (src/reconstruct.ts:50)
+- System prompt: `SYSTEM_PROMPT` constant (src/reconstruct.ts:71)
+- User prompt: `buildUserPrompt()` function (src/reconstruct.ts:78)
 
-**To change image generation prompts:** Edit `buildImagePrompt()` in src/image-generator.ts:66
-
-**JSON cleaning:** If Gemini response format changes, update the regex in src/reconstruct.ts:73
+**To change image generation prompts:** Edit `buildImagePrompt()` in src/reconstruct.ts:125
